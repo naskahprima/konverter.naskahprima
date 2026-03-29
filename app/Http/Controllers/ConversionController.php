@@ -11,8 +11,6 @@ use Illuminate\Support\Facades\Storage;
 
 class ConversionController extends Controller
 {
-    // ── Form Upload Skripsi ───────────────────────────────────────────────────
-
     public function create()
     {
         $user = Auth::user();
@@ -25,20 +23,19 @@ class ConversionController extends Controller
         return view('conversions.create', ['tokenBalance' => $user->token_balance]);
     }
 
-    // ── Submit Form → Mulai Proses ────────────────────────────────────────────
-
     public function store(Request $request)
     {
         $request->validate([
-            'skripsi'          => 'required|file|mimes:pdf,doc,docx|max:20480',  // 20MB
-            'template'         => 'required|file|mimes:doc,docx|max:10240',      // 10MB
+            'naskah'           => 'required|file|mimes:pdf,doc,docx|max:20480',
+            'template'         => 'required|file|mimes:doc,docx|max:10240',
+            'document_type'    => 'nullable|in:skripsi,jurnal,paper,artikel,tesis',
             'author_guide_url' => 'nullable|url|max:2048',
             'archive_urls'     => 'nullable|string|max:5000',
         ], [
-            'skripsi.required'  => 'File skripsi wajib diupload.',
-            'skripsi.mimes'     => 'File skripsi harus berformat PDF, DOC, atau DOCX.',
-            'skripsi.max'       => 'Ukuran file skripsi maksimal 20MB.',
-            'template.required' => 'Template jurnal wajib diupload.',
+            'naskah.required' => 'File naskah akademik wajib diupload.',
+            'naskah.mimes'    => 'File naskah harus berformat PDF, DOC, atau DOCX.',
+            'naskah.max'      => 'Ukuran file naskah maksimal 20MB.',
+            'template.required' => 'Template jurnal target wajib diupload.',
             'template.mimes'    => 'Template harus berformat DOC atau DOCX.',
         ]);
 
@@ -48,10 +45,8 @@ class ConversionController extends Controller
             return redirect()->back()->with('error', 'Token kamu habis!');
         }
 
-        // Kurangi token
         $user->decrement('token_balance');
 
-        // Parse archive URLs (1 URL per baris)
         $archiveUrls = [];
         if ($request->filled('archive_urls')) {
             $archiveUrls = array_values(array_filter(
@@ -60,26 +55,23 @@ class ConversionController extends Controller
             ));
         }
 
-        // Buat record konversi
         $conversion = Conversion::create([
             'user_id'          => $user->id,
+            'document_type'    => $request->document_type ?? 'skripsi',
             'author_guide_url' => $request->author_guide_url,
             'archive_urls'     => $archiveUrls,
             'status'           => Conversion::STATUS_PENDING,
         ]);
 
-        // Simpan file
-        $this->storeFile($request->file('skripsi'),  $conversion->id, 'skripsi');
+        // Simpan dengan type 'naskah' (support lama 'skripsi' tetap lewat model)
+        $this->storeFile($request->file('naskah'),  $conversion->id, 'naskah');
         $this->storeFile($request->file('template'), $conversion->id, 'template');
 
-        // Dispatch background job
         ProcessConversionJob::dispatch($conversion->id, 'analyze');
 
         return redirect()->route('conversions.show', $conversion->id)
-            ->with('success', 'Upload berhasil! AI sedang menganalisis dokumenmu...');
+            ->with('success', 'Upload berhasil! AI sedang menganalisis naskahmu...');
     }
-
-    // ── Halaman Status & Chat ─────────────────────────────────────────────────
 
     public function show(Conversion $conversion)
     {
@@ -92,8 +84,6 @@ class ConversionController extends Controller
 
         return view('conversions.show', compact('conversion'));
     }
-
-    // ── Upload File Fallback ──────────────────────────────────────────────────
 
     public function uploadFallback(Request $request, Conversion $conversion)
     {
@@ -109,7 +99,6 @@ class ConversionController extends Controller
             $this->storeFile($file, $conversion->id, $request->fallback_type);
         }
 
-        // Reset status dan restart analysis
         $updates = ['status' => Conversion::STATUS_PENDING];
 
         if ($request->fallback_type === 'author_guide_manual') {
@@ -118,7 +107,6 @@ class ConversionController extends Controller
 
         $conversion->update($updates);
 
-        // Dispatch ulang job analyze
         ProcessConversionJob::dispatch($conversion->id, 'analyze');
 
         return response()->json([
@@ -126,8 +114,6 @@ class ConversionController extends Controller
             'message' => 'File diterima! Analisis dilanjutkan...',
         ]);
     }
-
-    // ── Submit Jawaban Q&A → Mulai Konversi ───────────────────────────────────
 
     public function submitQa(Request $request, Conversion $conversion)
     {
@@ -146,7 +132,6 @@ class ConversionController extends Controller
             'status'     => Conversion::STATUS_PENDING,
         ]);
 
-        // Dispatch job konversi
         ProcessConversionJob::dispatch($conversion->id, 'convert');
 
         return response()->json([
@@ -154,8 +139,6 @@ class ConversionController extends Controller
             'message' => 'Jawaban diterima! AI mulai menulis jurnal...',
         ]);
     }
-
-    // ── Polling Status (untuk auto-refresh UI) ────────────────────────────────
 
     public function poll(Conversion $conversion)
     {
@@ -166,17 +149,19 @@ class ConversionController extends Controller
         ]);
 
         return response()->json([
-            'status'              => $conversion->status,
-            'status_label'        => $conversion->statusLabel(),
-            'is_completed'        => $conversion->status === Conversion::STATUS_COMPLETED,
-            'is_failed'           => $conversion->status === Conversion::STATUS_FAILED,
-            'needs_user_action'   => $conversion->needsUserAction(),
+            'status'                => $conversion->status,
+            'status_label'          => $conversion->statusLabel(),
+            'is_completed'          => $conversion->status === Conversion::STATUS_COMPLETED,
+            'is_failed'             => $conversion->status === Conversion::STATUS_FAILED,
+            'is_rejected'           => $conversion->status === Conversion::STATUS_REJECTED,
+            'needs_user_action'     => $conversion->needsUserAction(),
             'author_guide_fallback' => $conversion->author_guide_fallback,
-            'archive_fallback'    => $conversion->archive_fallback,
-            'scope_match'         => $conversion->scope_match,
+            'archive_fallback'      => $conversion->archive_fallback,
+            'scope_match'           => $conversion->scope_match,
+            'scope_match_percentage' => $conversion->getScopeMatchPercentage(),
             'title_recommendations' => $conversion->title_recommendations ?? [],
-            'qa_questions'        => $conversion->qa_questions ?? [],
-            'messages'            => $conversion->messages->map(fn($m) => [
+            'qa_questions'          => $conversion->qa_questions ?? [],
+            'messages'              => $conversion->messages->map(fn($m) => [
                 'id'         => $m->id,
                 'role'       => $m->role,
                 'type'       => $m->type,
@@ -185,8 +170,6 @@ class ConversionController extends Controller
             ]),
         ]);
     }
-
-    // ── Halaman Hasil ─────────────────────────────────────────────────────────
 
     public function result(Conversion $conversion)
     {
@@ -200,8 +183,6 @@ class ConversionController extends Controller
 
         return view('conversions.result', compact('conversion', 'checklist'));
     }
-
-    // ── Download File Output ──────────────────────────────────────────────────
 
     public function download(Conversion $conversion)
     {
@@ -220,8 +201,6 @@ class ConversionController extends Controller
         return Storage::download($conversion->output_path, $filename);
     }
 
-    // ── Riwayat Konversi User ─────────────────────────────────────────────────
-
     public function index()
     {
         $conversions = Conversion::where('user_id', Auth::id())
@@ -230,8 +209,6 @@ class ConversionController extends Controller
 
         return view('conversions.index', compact('conversions'));
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private function storeFile($file, int $conversionId, string $type): ConversionFile
     {

@@ -19,23 +19,23 @@ use Smalot\PdfParser\Parser as PdfParser;
 /**
  * ProcessConversionJob
  *
- * Orkestrator utama konversi skripsi → jurnal.
- * Berjalan di background (queue), bukan request-response langsung.
+ * Orkestrator utama konversi naskah akademik → jurnal.
+ * Mendukung: skripsi, tesis, jurnal lama, paper, prosiding, artikel ilmiah.
  *
  * Phase:
- *   analyze → PHASE 2 & 3: Baca semua dokumen + generate diagnosis
- *   convert → PHASE 5: Generate konten jurnal + buat file DOCX
+ *   analyze → Baca dokumen + diagnosis + scope check
+ *   convert → Generate konten jurnal + buat file DOCX
  */
 class ProcessConversionJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public int $timeout = 600; // 10 menit max per job
-    public int $tries   = 2;   // retry sekali kalau gagal
+    public int $timeout = 600;
+    public int $tries   = 2;
 
     public function __construct(
         private readonly int    $conversionId,
-        private readonly string $phase = 'analyze' // 'analyze' | 'convert'
+        private readonly string $phase = 'analyze'
     ) {}
 
     public function handle(
@@ -74,35 +74,36 @@ class ProcessConversionJob implements ShouldQueue
         $this->msg($conversion, 'system', 'info', '🔍 Proses analisis dimulai...');
         $conversion->update(['status' => Conversion::STATUS_ANALYZING]);
 
-        // ── STEP 1: Baca & ekstrak skripsi ───────────────────────────────────
-        $this->msg($conversion, 'ai', 'info', '📄 Membaca file skripsi...');
+        // ── STEP 1: Baca naskah sumber ────────────────────────────────────────
+        $this->msg($conversion, 'ai', 'info', '📄 Membaca naskah akademikmu...');
 
-        $thesisContent = $this->extractSkripsi($conversion);
-        if (!$thesisContent) {
-            $this->failConversion($conversion, 'Gagal membaca file skripsi. Pastikan file tidak rusak atau terproteksi password.');
+        $documentContent = $this->extractSourceDocument($conversion);
+        if (!$documentContent) {
+            $this->failConversion($conversion, 'Gagal membaca file naskah. Pastikan file tidak rusak atau terproteksi password.');
             return;
         }
 
-        $conversion->update(['thesis_content' => mb_substr($thesisContent, 0, 100000)]);
-        $this->msg($conversion, 'ai', 'info', '✅ Skripsi berhasil dibaca!');
+        // Simpan ke document_content (dan thesis_content untuk BC)
+        $conversion->update([
+            'document_content' => mb_substr($documentContent, 0, 100000),
+            'thesis_content'   => mb_substr($documentContent, 0, 100000),
+        ]);
+        $this->msg($conversion, 'ai', 'info', '✅ Naskah berhasil dibaca!');
 
         // ── STEP 2: Baca Author Guide ─────────────────────────────────────────
         $authorGuideContent = $this->readAuthorGuide($conversion, $urlReader);
         if ($authorGuideContent === null) {
-            // runAnalysisPhase sudah handle fallback message di dalam readAuthorGuide
             return;
         }
-
         $conversion->update(['author_guide_content' => mb_substr($authorGuideContent, 0, 50000)]);
         $this->msg($conversion, 'ai', 'info', '✅ Author Guide berhasil dibaca!');
 
-        // ── STEP 3: Baca Archive Jurnal ───────────────────────────────────────
+        // ── STEP 3: Baca Archive ──────────────────────────────────────────────
         $archiveContent = $this->readArchive($conversion, $urlReader);
-        // Archive bisa kosong kalau semua URL gagal — kita lanjut dengan data terbatas
         $conversion->update(['archive_content' => mb_substr($archiveContent, 0, 80000)]);
 
-        // ── STEP 4: AI Analisis Dokumen ───────────────────────────────────────
-        $this->msg($conversion, 'ai', 'info', '🧠 AI sedang menganalisis Author Guide...');
+        // ── STEP 4: AI Analisis ───────────────────────────────────────────────
+        $this->msg($conversion, 'ai', 'info', '🧠 AI sedang menganalisis Author Guide jurnal target...');
         $authorGuideAnalysis = $gemini->analyzeAuthorGuide($authorGuideContent);
         if (!$authorGuideAnalysis) {
             $this->failConversion($conversion, 'Gagal menganalisis Author Guide. Coba lagi.');
@@ -114,24 +115,24 @@ class ProcessConversionJob implements ShouldQueue
         if (!empty(trim($archiveContent))) {
             $archiveAnalysis = $gemini->analyzeArchivePatterns($archiveContent);
         }
-        $archiveAnalysis ??= ['note' => 'Data archive tidak tersedia, AI menggunakan pola dari Author Guide'];
+        $archiveAnalysis ??= ['note' => 'Data archive tidak tersedia'];
 
-        $this->msg($conversion, 'ai', 'info', '🧠 AI sedang menganalisis skripsi...');
-        $thesisSummary = $gemini->extractThesisSummary($thesisContent);
-        if (!$thesisSummary) {
-            $this->failConversion($conversion, 'Gagal menganalisis skripsi. Coba lagi.');
+        $this->msg($conversion, 'ai', 'info', '🧠 AI sedang menganalisis naskahmu...');
+        $documentSummary = $gemini->extractThesisSummary($documentContent);
+        if (!$documentSummary) {
+            $this->failConversion($conversion, 'Gagal menganalisis naskah. Coba lagi.');
             return;
         }
 
-        // ── STEP 5: Generate Diagnosis Report ────────────────────────────────
+        // ── STEP 5: Generate Diagnosis ────────────────────────────────────────
         $this->msg($conversion, 'ai', 'info', '📊 AI sedang membuat diagnosis report...');
-        $diagnosis = $gemini->generateDiagnosisReport($authorGuideAnalysis, $archiveAnalysis, $thesisSummary);
+        $diagnosis = $gemini->generateDiagnosisReport($authorGuideAnalysis, $archiveAnalysis, $documentSummary);
         if (!$diagnosis) {
             $this->failConversion($conversion, 'Gagal membuat diagnosis. Coba lagi.');
             return;
         }
 
-        // Simpan hasil analisis
+        // Simpan hasil diagnosis dulu
         $conversion->update([
             'scope_match'           => $diagnosis['scope_match'] ?? 'unknown',
             'scope_match_reason'    => $diagnosis['scope_match_reason'] ?? '',
@@ -140,10 +141,21 @@ class ProcessConversionJob implements ShouldQueue
             'compliance_check'      => $diagnosis['compliance_check'] ?? [],
             'diagnosis_report'      => json_encode($diagnosis, JSON_UNESCAPED_UNICODE),
             'qa_questions'          => $diagnosis['smart_questions'] ?? [],
-            'status'                => Conversion::STATUS_AWAITING_QA,
         ]);
 
-        // Tampilkan diagnosis ke user sebagai pesan
+        // ── STEP 6: SCOPE MATCH CHECK ─────────────────────────────────────────
+        $scopePct   = (int) ($diagnosis['scope_match_percentage'] ?? 0);
+        $threshold  = GeminiService::SCOPE_MATCH_THRESHOLD;
+
+        if ($scopePct < $threshold) {
+            // ❌ TOLAK — naskah tidak sesuai scope
+            $this->rejectConversion($conversion, $diagnosis, $scopePct, $threshold);
+            return;
+        }
+
+        // ── STEP 7: Lanjut ke Q&A ─────────────────────────────────────────────
+        $conversion->update(['status' => Conversion::STATUS_AWAITING_QA]);
+
         $diagnosisMessage = $this->buildDiagnosisMessage($diagnosis);
         $this->msg($conversion, 'ai', 'diagnosis', $diagnosisMessage);
     }
@@ -163,7 +175,6 @@ class ProcessConversionJob implements ShouldQueue
         $diagnosis  = json_decode($conversion->diagnosis_report ?? '[]', true) ?? [];
         $qaAnswers  = $conversion->qa_answers ?? [];
 
-        // Judul yang dipilih user (kalau tidak dipilih, pakai rekomendasi pertama)
         $selectedTitle = $qaAnswers['selected_title']
             ?? ($conversion->title_recommendations[0]['title'] ?? 'Judul Jurnal');
 
@@ -172,14 +183,14 @@ class ProcessConversionJob implements ShouldQueue
             true
         ) ?? [];
 
-        // Coba parse author guide analysis dari content
-        // (disimpan sebagai teks, bukan JSON)
-        $agContent = $conversion->author_guide_content ?? '';
-
         $this->msg($conversion, 'ai', 'info', '✍️ AI sedang menulis konten jurnal...');
 
+        $documentContent = $conversion->document_content
+            ?? $conversion->thesis_content
+            ?? '';
+
         $journalContent = $gemini->generateJournalContent(
-            thesisContent:       $conversion->thesis_content ?? '',
+            documentContent:     $documentContent,
             authorGuideAnalysis: $authorGuideAnalysis,
             selectedTitle:       $selectedTitle,
             diagnosisReport:     $diagnosis,
@@ -191,7 +202,6 @@ class ProcessConversionJob implements ShouldQueue
             return;
         }
 
-        // Generate DOCX
         $this->msg($conversion, 'ai', 'info', '📝 Membuat file Word...');
 
         $templateFile = $conversion->files()->where('type', 'template')->first();
@@ -219,15 +229,18 @@ class ProcessConversionJob implements ShouldQueue
     // HELPERS — Baca Dokumen
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private function extractSkripsi(Conversion $conversion): ?string
+    private function extractSourceDocument(Conversion $conversion): ?string
     {
-        $file = $conversion->files()->where('type', 'skripsi')->first();
+        // Support file type 'naskah' (baru) dan 'skripsi' (lama)
+        $file = $conversion->files()
+            ->whereIn('type', ['naskah', 'skripsi'])
+            ->first();
+
         return $file ? $this->extractFileContent($file->fullPath(), $file->extension()) : null;
     }
 
     private function readAuthorGuide(Conversion $conversion, UrlReaderService $urlReader): ?string
     {
-        // Coba dari URL dulu
         if ($conversion->author_guide_url) {
             $content = $urlReader->read($conversion->author_guide_url);
             if ($content && !str_starts_with($content, '__PDF_URL__:')) {
@@ -235,14 +248,12 @@ class ProcessConversionJob implements ShouldQueue
             }
         }
 
-        // Coba dari file manual yang sudah diupload
         $manualFile = $conversion->files()->where('type', 'author_guide_manual')->first();
         if ($manualFile) {
             $this->msg($conversion, 'ai', 'info', '📁 Membaca Author Guide dari file yang diupload...');
             return $this->extractFileContent($manualFile->fullPath(), $manualFile->extension());
         }
 
-        // ⚠️ FALLBACK — Minta user upload manual
         $conversion->update([
             'status'               => Conversion::STATUS_WAITING_FALLBACK,
             'author_guide_fallback' => true,
@@ -256,12 +267,12 @@ class ProcessConversionJob implements ShouldQueue
             . "Ini bisa terjadi karena website jurnal memiliki perlindungan bot, atau sedang down.\n\n"
             . "**Yang perlu kamu lakukan:**\n"
             . "1. Buka website jurnal target secara manual\n"
-            . "2. Download halaman Author Guide / Submission Guidelines (biasanya bisa Save as PDF)\n"
+            . "2. Download halaman Author Guide / Submission Guidelines (Save as PDF)\n"
             . "3. Upload file PDF atau Word tersebut di form di bawah\n\n"
             . "Setelah upload, klik **Lanjutkan Analisis** dan AI akan melanjutkan prosesnya."
         );
 
-        return null; // Signal ke caller untuk berhenti
+        return null;
     }
 
     private function readArchive(Conversion $conversion, UrlReaderService $urlReader): string
@@ -271,30 +282,25 @@ class ProcessConversionJob implements ShouldQueue
 
         if (!empty($archiveUrls)) {
             $this->msg($conversion, 'ai', 'info', '🔗 Membaca archive jurnal yang lolos...');
-            $results     = $urlReader->readMultiple($archiveUrls);
+            $results      = $urlReader->readMultiple($archiveUrls);
             $successCount = $urlReader->countSuccess($results);
             $archiveContent = $urlReader->mergeContent($results);
 
             if ($successCount === 0) {
                 $conversion->update(['archive_fallback' => true]);
-
                 $this->msg(
                     $conversion,
                     'ai',
                     'fallback_request',
-                    "⚠️ **Archive jurnal tidak bisa diakses otomatis dari URL yang diberikan.**\n\n"
-                    . "Kamu bisa upload contoh jurnal yang sudah lolos secara manual (3-5 file PDF) "
-                    . "di form yang muncul di bawah.\n\n"
-                    . "Atau klik **Lanjutkan Tanpa Archive** — AI akan tetap berjalan "
-                    . "tapi hasilnya mungkin kurang optimal karena tidak ada pola referensi."
+                    "⚠️ **Archive jurnal tidak bisa diakses otomatis.**\n\n"
+                    . "Kamu bisa upload contoh jurnal yang sudah lolos (3-5 file PDF) di form yang muncul di bawah.\n\n"
+                    . "Atau klik **Lanjutkan Tanpa Archive** — AI akan tetap berjalan tapi hasilnya mungkin kurang optimal."
                 );
-                // Kita tidak stop di sini — archive optional, analysis tetap lanjut
             } else {
                 $this->msg($conversion, 'ai', 'info', "✅ {$successCount} archive jurnal berhasil dibaca!");
             }
         }
 
-        // Tambahkan archive manual kalau ada
         $manualArchives = $conversion->files()->where('type', 'archive_manual')->get();
         foreach ($manualArchives as $archiveFile) {
             $content = $this->extractFileContent($archiveFile->fullPath(), $archiveFile->extension());
@@ -340,13 +346,79 @@ class ProcessConversionJob implements ShouldQueue
                 return $text;
             }
 
-            // Untuk format lain, coba baca sebagai teks biasa
             return file_get_contents($fullPath) ?: null;
 
         } catch (\Exception $e) {
             Log::error("ExtractFileContent error [{$extension}]: " . $e->getMessage());
             return null;
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HELPERS — Rejection
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private function rejectConversion(
+        Conversion $conversion,
+        array      $diagnosis,
+        int        $scopePct,
+        int        $threshold
+    ): void {
+        $conversion->update(['status' => Conversion::STATUS_REJECTED]);
+
+        $scopeIcon = match ($diagnosis['scope_match'] ?? '') {
+            'partial'  => '⚠️',
+            'mismatch' => '❌',
+            default    => '❌',
+        };
+
+        $rejectionReason = $diagnosis['rejection_reason']
+            ?? "Topik naskah tidak sesuai dengan scope jurnal yang dipilih.";
+
+        // Saran jurnal alternatif
+        $alternativesText = '';
+        $alternatives = $diagnosis['alternative_journal_suggestions'] ?? [];
+        if (!empty($alternatives)) {
+            $alternativesText = "\n\n---\n\n### 💡 Jurnal yang Lebih Cocok untuk Naskahmu\n\n";
+            foreach ($alternatives as $i => $alt) {
+                $no = $i + 1;
+                if (is_array($alt)) {
+                    $name   = $alt['name'] ?? $alt['journal'] ?? "Jurnal $no";
+                    $reason = $alt['reason'] ?? '';
+                    $alternativesText .= "**{$no}. {$name}**\n→ _{$reason}_\n\n";
+                } else {
+                    $alternativesText .= "**{$no}.** {$alt}\n\n";
+                }
+            }
+        }
+
+        $message = <<<MSG
+## {$scopeIcon} Maaf, Naskahmu Tidak Sesuai Scope Jurnal Ini
+
+**Tingkat Kecocokan: {$scopePct}%** (minimum yang diperlukan: {$threshold}%)
+
+### Kenapa Ditolak?
+
+{$rejectionReason}
+{$alternativesText}
+
+---
+
+### 🔄 Apa yang Bisa Kamu Lakukan?
+
+1. **Coba jurnal lain** yang lebih sesuai dengan topik naskahmu (lihat rekomendasi di atas)
+2. **Upload konversi baru** dengan jurnal target yang berbeda
+3. **Hubungi tim NaskahPrima** jika kamu merasa ini keliru
+
+Token kamu **tidak dikurangi** karena proses dihentikan sebelum konversi dimulai.
+MSG;
+
+        $this->msg($conversion, 'ai', 'rejection', $message);
+
+        // Kembalikan token karena konversi gagal di tahap analisis
+        $conversion->user()->increment('token_balance');
+
+        Log::info("Conversion #{$conversion->id} rejected: scope {$scopePct}% < threshold {$threshold}%");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -362,25 +434,22 @@ class ProcessConversionJob implements ShouldQueue
             default    => '❓',
         };
 
-        $scopePct = $diagnosis['scope_match_percentage'] ?? 0;
+        $scopePct    = $diagnosis['scope_match_percentage'] ?? 0;
         $scopeReason = $diagnosis['scope_match_reason'] ?? '-';
 
-        // Judul recommendations
         $titlesText = '';
         foreach ($diagnosis['title_recommendations'] ?? [] as $i => $t) {
             $no = $i + 1;
             $titlesText .= "\n**Opsi {$no}:** {$t['title']}\n→ _{$t['reason']}_\n";
         }
 
-        // Gap analysis
         $gap = $diagnosis['gap_analysis'] ?? [];
 
-        $strengths  = implode("\n", array_map(fn($s) => "- ✅ {$s}", $gap['strengths'] ?? []));
-        $toAdd      = implode("\n", array_map(fn($s) => "- ➕ {$s}", $gap['to_add'] ?? []));
-        $toRemove   = implode("\n", array_map(fn($s) => "- ✂️ {$s}", $gap['to_remove'] ?? []));
+        $strengths   = implode("\n", array_map(fn($s) => "- ✅ {$s}", $gap['strengths'] ?? []));
+        $toAdd       = implode("\n", array_map(fn($s) => "- ➕ {$s}", $gap['to_add'] ?? []));
+        $toRemove    = implode("\n", array_map(fn($s) => "- ✂️ {$s}", $gap['to_remove'] ?? []));
         $toTransform = implode("\n", array_map(fn($s) => "- 🔄 {$s}", $gap['to_transform'] ?? []));
 
-        // Compliance check
         $compliance = $diagnosis['compliance_check'] ?? [];
         $complianceText = '';
         foreach ($compliance as $aspect => $check) {
@@ -408,7 +477,7 @@ class ProcessConversionJob implements ShouldQueue
 
 ### 🔍 Gap Analysis
 
-**Yang sudah bagus dari skripsimu:**
+**Yang sudah bagus dari naskahmu:**
 {$strengths}
 
 **Yang perlu ditambahkan:**

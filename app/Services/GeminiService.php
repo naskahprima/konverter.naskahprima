@@ -9,14 +9,17 @@ use Illuminate\Support\Facades\Log;
  * GeminiService
  *
  * Menangani semua komunikasi dengan Google Gemini API.
- * Didesain fleksibel — kalau mau switch ke Claude API nanti,
- * cukup ganti method generate() saja, logika di atasnya tidak berubah.
+ * Support konversi semua jenis naskah akademik:
+ * skripsi, jurnal, paper, prosiding, artikel ilmiah, dll.
  */
 class GeminiService
 {
     private string $apiKey;
-    private string $model  = 'gemini-1.5-pro';
+    private string $model   = 'gemini-1.5-pro';
     private string $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/';
+
+    /** Threshold minimum scope match agar konversi bisa dilanjutkan */
+    public const SCOPE_MATCH_THRESHOLD = 70;
 
     public function __construct()
     {
@@ -25,9 +28,6 @@ class GeminiService
 
     // ── Core HTTP Call ────────────────────────────────────────────────────────
 
-    /**
-     * Kirim prompt ke Gemini, dapatkan respons teks.
-     */
     public function generate(string $prompt, array $options = []): ?string
     {
         if (empty($this->apiKey)) {
@@ -65,9 +65,6 @@ class GeminiService
         }
     }
 
-    /**
-     * Kirim prompt, minta respons JSON terstruktur.
-     */
     public function generateJson(string $prompt): ?array
     {
         $jsonPrompt = $prompt
@@ -77,7 +74,6 @@ class GeminiService
         $raw = $this->generate($jsonPrompt, ['temperature' => 0.3]);
         if (!$raw) return null;
 
-        // Bersihkan markdown yang kadang ikut ke-generate
         $cleaned = preg_replace('/```json\s*|\s*```/', '', trim($raw));
 
         try {
@@ -140,7 +136,7 @@ PROMPT;
         $prompt = <<<PROMPT
 Kamu adalah reviewer jurnal senior yang ahli mengidentifikasi pola jurnal yang berhasil lolos publikasi.
 
-Berikut konten beberapa jurnal yang sudah lolos di jurnal target:
+Berikut konten beberapa jurnal/naskah yang sudah lolos di jurnal target:
 ---
 {$archiveContent}
 ---
@@ -168,21 +164,23 @@ PROMPT;
     }
 
     /**
-     * PHASE 2C — Ekstrak ringkasan skripsi
+     * PHASE 2C — Ekstrak ringkasan naskah akademik (skripsi, jurnal, paper, dll)
      */
-    public function extractThesisSummary(string $thesisContent): ?array
+    public function extractThesisSummary(string $documentContent): ?array
     {
         $prompt = <<<PROMPT
-Kamu adalah asisten akademik yang ahli membaca dan meringkas skripsi/thesis.
+Kamu adalah asisten akademik yang ahli membaca dan meringkas berbagai jenis naskah akademik
+(skripsi, tesis, jurnal, paper, prosiding, artikel ilmiah, dsb).
 
-Berikut konten skripsi:
+Berikut konten naskah akademik yang akan dikonversi:
 ---
-{$thesisContent}
+{$documentContent}
 ---
 
-Ekstrak semua informasi penting dari skripsi ini, kembalikan dalam format JSON:
+Ekstrak semua informasi penting dari naskah ini, kembalikan dalam format JSON:
 {
-    "original_title": "judul asli skripsi",
+    "document_type": "skripsi | tesis | jurnal | paper | prosiding | artikel | laporan_penelitian | lainnya",
+    "original_title": "judul asli naskah",
     "study_domain": "bidang ilmu, misal: Computer Science, Education, Public Health",
     "main_topic": "topik utama penelitian",
     "sub_topics": ["sub-topik1", "sub-topik2", "sub-topik3"],
@@ -203,15 +201,17 @@ PROMPT;
 
     /**
      * PHASE 3 — Generate Diagnosis Report lengkap
+     * Termasuk scope_match_percentage yang digunakan untuk validasi kelayakan
      */
     public function generateDiagnosisReport(
         array $authorGuideAnalysis,
         array $archiveAnalysis,
-        array $thesisSummary
+        array $documentSummary
     ): ?array {
         $agJson      = $this->toJson($authorGuideAnalysis);
         $archiveJson = $this->toJson($archiveAnalysis);
-        $thesisJson  = $this->toJson($thesisSummary);
+        $docJson     = $this->toJson($documentSummary);
+        $threshold   = self::SCOPE_MATCH_THRESHOLD;
 
         $prompt = <<<PROMPT
 Kamu adalah reviewer jurnal senior yang berpengalaman dan sangat jujur.
@@ -224,14 +224,16 @@ Kamu memiliki tiga sumber informasi:
 2. POLA JURNAL YANG SUDAH LOLOS DI JURNAL INI:
 {$archiveJson}
 
-3. RINGKASAN SKRIPSI YANG AKAN DIKONVERSI:
-{$thesisJson}
+3. RINGKASAN NASKAH AKADEMIK YANG AKAN DIKONVERSI:
+{$docJson}
 
 Berikan diagnosis lengkap. Kembalikan dalam format JSON:
 {
     "scope_match": "match | partial | mismatch",
     "scope_match_percentage": 85,
     "scope_match_reason": "penjelasan singkat kenapa cocok/kurang cocok/tidak cocok (3-4 kalimat)",
+    "rejection_reason": null,
+    "alternative_journal_suggestions": [],
     "title_recommendations": [
         {
             "title": "Judul Rekomendasi 1 (sesuai pola archive & author guide)",
@@ -247,7 +249,7 @@ Berikan diagnosis lengkap. Kembalikan dalam format JSON:
         }
     ],
     "gap_analysis": {
-        "strengths": ["hal yang sudah bagus dari skripsi dan cocok untuk jurnal ini"],
+        "strengths": ["hal yang sudah bagus dari naskah dan cocok untuk jurnal ini"],
         "to_add": ["hal yang perlu ditambahkan agar lolos reviewer"],
         "to_remove": ["hal yang perlu dihapus atau dipangkas karena tidak relevan"],
         "to_transform": ["bagian yang perlu diubah format/gaya penulisannya"]
@@ -268,11 +270,21 @@ Berikan diagnosis lengkap. Kembalikan dalam format JSON:
     ]
 }
 
-PENTING untuk smart_questions:
+ATURAN PENTING untuk scope_match_percentage:
+- Berikan angka yang JUJUR dan AKURAT berdasarkan kecocokan topik, metodologi, dan bidang ilmu
+- Kalau scope_match = "mismatch" → scope_match_percentage HARUS di bawah {$threshold}
+- Kalau scope_match = "match" → scope_match_percentage HARUS di atas 75
+- Kalau scope_match = "partial" → scope_match_percentage antara 50-75
+
+ATURAN untuk rejection_reason dan alternative_journal_suggestions:
+- Jika scope_match_percentage < {$threshold}: ISI rejection_reason dengan penjelasan detail (2-3 paragraf) kenapa naskah ini TIDAK COCOK untuk jurnal target
+- Jika scope_match_percentage < {$threshold}: ISI alternative_journal_suggestions dengan 3-5 NAMA JURNAL NYATA yang lebih cocok untuk naskah ini (beserta alasannya singkat)
+- Jika scope_match_percentage >= {$threshold}: biarkan rejection_reason = null dan alternative_journal_suggestions = []
+
+ATURAN untuk smart_questions:
 - Maksimal 3 pertanyaan
 - Hanya tanya hal yang TIDAK BISA kamu simpulkan sendiri dari dokumen
-- Contoh pertanyaan yang BAIK: "Apakah ada data primer terbaru yang belum masuk di skripsi?"
-- Contoh pertanyaan yang BURUK: "Apa topik skripsimu?" (sudah bisa dibaca dari skripsi)
+- Jangan tanya jika scope_match_percentage < {$threshold} (tidak perlu, karena akan ditolak)
 PROMPT;
 
         return $this->generateJson($prompt);
@@ -282,26 +294,28 @@ PROMPT;
      * PHASE 5 — Generate konten jurnal final
      */
     public function generateJournalContent(
-        string $thesisContent,
+        string $documentContent,
         array  $authorGuideAnalysis,
         string $selectedTitle,
         array  $diagnosisReport,
         array  $qaAnswers = []
     ): ?array {
-        $agJson       = $this->toJson($authorGuideAnalysis);
-        $diagJson     = $this->toJson($diagnosisReport['gap_analysis'] ?? []);
+        $agJson         = $this->toJson($authorGuideAnalysis);
+        $diagJson       = $this->toJson($diagnosisReport['gap_analysis'] ?? []);
         $complianceJson = $this->toJson($diagnosisReport['compliance_check'] ?? []);
 
         $qaText = '';
         if (!empty($qaAnswers)) {
             $qaText = "INFORMASI TAMBAHAN DARI USER (Jawaban Q&A):\n";
             foreach ($qaAnswers as $question => $answer) {
+                if ($question === 'selected_title') continue;
                 $qaText .= "- {$question}: {$answer}\n";
             }
         }
 
         $prompt = <<<PROMPT
-Kamu adalah penulis akademik profesional yang ahli mengkonversi skripsi menjadi jurnal ilmiah siap submit.
+Kamu adalah penulis akademik profesional yang ahli mengkonversi berbagai jenis naskah akademik
+(skripsi, jurnal lama, paper, prosiding, dll) menjadi artikel jurnal ilmiah baru yang siap submit.
 
 JUDUL YANG DIPILIH USER: {$selectedTitle}
 
@@ -314,13 +328,13 @@ Compliance Issues: {$complianceJson}
 
 {$qaText}
 
-KONTEN SKRIPSI SUMBER:
+KONTEN NASKAH SUMBER:
 ---
-{$thesisContent}
+{$documentContent}
 ---
 
 Tugas kamu:
-1. Konversikan skripsi menjadi artikel jurnal yang SEPENUHNYA sesuai author guide
+1. Konversikan naskah menjadi artikel jurnal yang SEPENUHNYA sesuai author guide
 2. Sesuaikan gaya bahasa, struktur, dan format
 3. Padatkan konten yang terlalu panjang, tambahkan yang kurang
 4. Pastikan sitasi menggunakan format yang diminta author guide
@@ -330,15 +344,14 @@ Kembalikan dalam format JSON:
     "title": "judul final yang dipilih",
     "abstract": "abstract 150-250 kata sesuai panduan",
     "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-    "introduction": "Isi pendahuluan yang sudah diformat untuk jurnal (bukan skripsi)",
-    "literature_review": "Tinjauan pustaka yang relevan dan terkini (atau null jika tidak wajib di author guide)",
+    "introduction": "Isi pendahuluan yang sudah diformat untuk jurnal",
+    "literature_review": "Tinjauan pustaka yang relevan dan terkini (atau null jika tidak wajib)",
     "methodology": "Metodologi yang sudah disesuaikan dengan format jurnal",
     "results": "Hasil penelitian yang disajikan secara akademik",
     "discussion": "Pembahasan yang menghubungkan temuan dengan literatur",
     "conclusion": "Kesimpulan yang ringkas dan impactful",
     "references": [
-        "Penulis, A. (Tahun). Judul artikel. Nama Jurnal, Vol(No), hal. DOI",
-        "dst dalam format sesuai citation style dari author guide"
+        "Penulis, A. (Tahun). Judul artikel. Nama Jurnal, Vol(No), hal. DOI"
     ],
     "submission_checklist": [
         "✅ Judul sudah sesuai pola yang direkomendasikan",
